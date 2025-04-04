@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { supabase } from './lib/supabase';
+import { supabase, checkSupabaseAuth, checkSupabaseDB } from './lib/supabase';
 import { getCurrentUser } from './lib/auth';
 import Layout from './components/Layout';
 import Auth from './components/Auth';
@@ -25,84 +25,191 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  const [authStateChangeCalled, setAuthStateChangeCalled] = useState(false);
 
+  const addDebugInfo = (message: string) => {
+    console.log(message);
+    setDebugInfo(prev => {
+      // Limit to last 20 messages to prevent memory issues
+      const newMessages = [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`];
+      return newMessages.slice(-20);
+    });
+  };
+
+  // Use a ref to track if initial auth state setup is complete
+  const initialAuthComplete = React.useRef(false);
+
+  // Separate useEffect for auth state change listener to avoid interaction with initialization
   useEffect(() => {
     let mounted = true;
 
-    async function initializeAuth() {
-      try {
-        if (!mounted) return;
+    // Only set up listener if not already done
+    if (!authStateChangeCalled) {
+      addDebugInfo('Setting up auth state listener (first time)');
+      setAuthStateChangeCalled(true);
+      
+      const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+        addDebugInfo(`Auth state changed: ${event}`);
         
+        // Skip handling during initial load to prevent duplication
+        if (!mounted || !initialAuthComplete.current) {
+          addDebugInfo('Skipping auth change handler - initial auth not complete');
+          return;
+        }
+        
+        if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+          addDebugInfo(`Getting user data after ${event}`);
+          try {
+            const currentUser = await getCurrentUser();
+            if (mounted) {
+              setUser(currentUser);
+              addDebugInfo(`User data updated: ${currentUser?.email || 'Unknown'}`);
+            }
+          } catch (userErr) {
+            addDebugInfo(`Error getting user data: ${userErr instanceof Error ? userErr.message : 'Unknown error'}`);
+          }
+        } else if (event === 'SIGNED_OUT') {
+          if (mounted) {
+            setUser(null);
+            addDebugInfo('User signed out');
+          }
+        }
+      });
+
+      return () => {
+        addDebugInfo('Cleaning up auth state listener...');
+        mounted = false;
+        subscription.unsubscribe();
+      };
+    }
+  }, [authStateChangeCalled]);
+
+  // Main initialization effect
+  useEffect(() => {
+    let mounted = true;
+    let retryCount = 0;
+    const maxRetries = 3;
+    
+    addDebugInfo('App startup - initializing authentication');
+
+    async function initializeAuth() {
+      if (!mounted) return;
+      
+      if (initialAuthComplete.current) {
+        addDebugInfo('Initial auth already completed, skipping redundant initialization');
+        return;
+      }
+      
+      try {
+        addDebugInfo('Initializing auth...');
         setLoading(true);
         setError(null);
 
-        console.log('Checking Supabase session...');
+        // First, check if we can connect to Supabase auth services
+        addDebugInfo('Checking Supabase connection...');
+        const isAuthWorking = await checkSupabaseAuth();
+        
+        if (!isAuthWorking) {
+          addDebugInfo('Authentication service connection failed');
+          throw new Error('Unable to connect to authentication service');
+        }
+        
+        addDebugInfo('Authentication service connection successful');
+
+        // Check database connection but don't block on failure
+        const isDBWorking = await checkSupabaseDB();
+        if (!isDBWorking) {
+          addDebugInfo('Database connection check failed - continuing anyway');
+        } else {
+          addDebugInfo('Database connection successful');
+        }
+
+        // Get the current session
+        addDebugInfo('Fetching current session...');
         const { data: { session }, error: sessionError } = await supabase.auth.getSession();
         
         if (sessionError) {
-          console.error('Error getting session:', sessionError);
-          if (mounted) {
-            setError('Failed to check authentication status');
-            setLoading(false);
-          }
-          return;
+          addDebugInfo(`Session error: ${sessionError.message}`);
+          throw sessionError;
         }
 
-        console.log('Session check result:', session ? 'Session found' : 'No session');
-
         if (!session) {
+          addDebugInfo('No active session found');
+          
           if (mounted) {
             setUser(null);
             setLoading(false);
             setAuthChecked(true);
+            initialAuthComplete.current = true;
           }
           return;
         }
 
-        console.log('Getting user data...');
-        const currentUser = await getCurrentUser();
-        console.log('User data:', currentUser);
+        // We have a session, get the user data
+        addDebugInfo(`Active session found for user ID: ${session.user.id}`);
+        addDebugInfo('Fetching current user data...');
         
-        if (mounted) {
-          setUser(currentUser);
-          setAuthChecked(true);
-          setLoading(false);
+        try {
+          const currentUser = await getCurrentUser();
+          
+          if (mounted) {
+            setUser(currentUser);
+            addDebugInfo(`User data fetch complete: ${currentUser?.email || 'Unknown user'}`);
+            initialAuthComplete.current = true;
+          }
+        } catch (userError) {
+          addDebugInfo(`Error fetching user data: ${userError instanceof Error ? userError.message : 'Unknown error'}`);
+          // Even if we can't get full user data, we have confirmation the user is authenticated
+          if (mounted) {
+            // Create a minimal user object from session data
+            setUser({
+              id: session.user.id,
+              email: session.user.email || '',
+              role: 'customer', // Default role
+              created_at: session.user.created_at || new Date().toISOString()
+            });
+            addDebugInfo('Using minimal user data from session');
+            initialAuthComplete.current = true;
+          }
         }
       } catch (err) {
+        addDebugInfo(`Error in initialization: ${err instanceof Error ? err.message : 'Unknown error'}`);
         console.error('Error initializing auth:', err);
+        
+        if (mounted && retryCount < maxRetries) {
+          retryCount++;
+          const delay = Math.min(1000 * retryCount, 5000); // Exponential backoff with max of 5 seconds
+          addDebugInfo(`Retry ${retryCount}/${maxRetries} in ${delay}ms...`);
+          
+          setTimeout(initializeAuth, delay);
+          return; // Don't update state yet, we're retrying
+        }
+        
         if (mounted) {
-          setError('Failed to initialize application');
+          setError('Failed to initialize application after multiple attempts. Please refresh the page.');
+          initialAuthComplete.current = true; // Mark as complete even though it failed
+        }
+      } finally {
+        if (mounted) {
           setLoading(false);
+          setAuthChecked(true);
         }
       }
     }
 
     initializeAuth();
 
-    console.log('Setting up auth state listener...');
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log('Auth state changed:', event);
-      if (!mounted) return;
-
-      if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
-        const currentUser = await getCurrentUser();
-        setUser(currentUser);
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null);
-      }
-    });
-
     return () => {
       mounted = false;
-      console.log('Cleaning up auth state listener...');
-      subscription.unsubscribe();
     };
-  }, []);
+  }, []); // Empty deps to only run once
 
   const handleRetry = () => {
     window.location.reload();
   };
 
+  // Show clean loading spinner without debug info
   if (loading && !authChecked) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -117,10 +224,18 @@ function App() {
   if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <div className="text-center">
+        <div className="text-center max-w-md">
           <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-md mb-4">
             {error}
           </div>
+          {debugInfo.length > 0 && (
+            <div className="mb-4 p-4 text-left text-xs text-gray-500 bg-gray-50 rounded-md max-h-64 overflow-auto">
+              <div className="font-semibold mb-1">Debug Information:</div>
+              {debugInfo.map((info, idx) => (
+                <div key={idx}>{info}</div>
+              ))}
+            </div>
+          )}
           <button
             onClick={handleRetry}
             className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
@@ -173,4 +288,4 @@ function App() {
   );
 }
 
-export default App
+export default App;
