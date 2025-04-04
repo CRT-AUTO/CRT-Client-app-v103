@@ -1,4 +1,5 @@
 import { supabase, logSupabaseError } from './supabase';
+import { isNetworkError } from './errorHandling';
 import type { 
   SocialConnection, 
   VoiceflowMapping, 
@@ -584,54 +585,128 @@ export async function getMessageAnalytics(userId: string, daysBack = 7): Promise
       console.warn('No user ID provided for message analytics');
       return createEmptyAnalytics(daysBack);
     }
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - daysBack);
-    const { data: conversations, error: conversationsError } = await supabase.from('conversations').select('id, platform').eq('user_id', userId);
-    if (conversationsError) {
-      console.error(`Error fetching conversations for analytics for user ${userId}:`, conversationsError);
-      logSupabaseError(`getMessageAnalytics - conversations (${userId})`, conversationsError);
-      return createEmptyAnalytics(daysBack);
-    }
-    if (!conversations || conversations.length === 0) return createEmptyAnalytics(daysBack);
-    const conversationIds = conversations.map(c => c.id);
-    const { data, error } = await supabase.from('messages').select(`
-      id,
-      sent_at,
-      sender_type,
-      conversation_id
-    `).in('conversation_id', conversationIds).gte('sent_at', startDate.toISOString());
-    if (error) {
-      console.error(`Error fetching messages for analytics for user ${userId}:`, error);
-      logSupabaseError(`getMessageAnalytics - messages (${userId})`, error);
-      return createEmptyAnalytics(daysBack);
-    }
-    const platformMap = conversations.reduce((map, conv) => {
-      map[conv.id] = conv.platform;
-      return map;
-    }, {} as Record<string, string>);
-    const messagesByDay = initializeMessagesByDay(daysBack);
-    if (data && data.length > 0) {
-      data.forEach(message => {
-        const day = new Date(message.sent_at).toLocaleDateString();
-        if (messagesByDay[day]) {
-          messagesByDay[day].total += 1;
-          const convPlatform = platformMap[message.conversation_id];
-          if (convPlatform === 'facebook') {
-            messagesByDay[day].facebook += 1;
-          } else if (convPlatform === 'instagram') {
-            messagesByDay[day].instagram += 1;
-          }
-          if (message.sender_type === 'user') {
-            messagesByDay[day].user += 1;
-          } else if (message.sender_type === 'assistant') {
-            messagesByDay[day].assistant += 1;
+    
+    // Start with empty analytics as fallback
+    const emptyAnalytics = createEmptyAnalytics(daysBack);
+    
+    // Implement retry mechanism with backoff
+    const maxRetries = 3;
+    let retryCount = 0;
+    let lastError: Error | null = null;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - daysBack);
+        
+        // First get all conversations for this user
+        const { data: conversations, error: conversationsError } = await supabase
+          .from('conversations')
+          .select('id, platform')
+          .eq('user_id', userId);
+          
+        if (conversationsError) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching conversations for analytics:`, conversationsError);
+          logSupabaseError(`getMessageAnalytics - conversations (${userId})`, conversationsError);
+          
+          if (isNetworkError(conversationsError)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error, return empty data
+            return emptyAnalytics;
           }
         }
-      });
+        
+        if (!conversations || conversations.length === 0) {
+          return emptyAnalytics;
+        }
+        
+        const conversationIds = conversations.map(c => c.id);
+        
+        // Then get messages for these conversations
+        const { data, error } = await supabase
+          .from('messages')
+          .select(`
+            id,
+            sent_at,
+            sender_type,
+            conversation_id
+          `)
+          .in('conversation_id', conversationIds)
+          .gte('sent_at', startDate.toISOString());
+          
+        if (error) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching messages for analytics:`, error);
+          logSupabaseError(`getMessageAnalytics - messages (${userId})`, error);
+          
+          if (isNetworkError(error)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error, return empty data
+            return emptyAnalytics;
+          }
+        }
+        
+        // If we got here, the request was successful
+        const platformMap = conversations.reduce((map, conv) => {
+          map[conv.id] = conv.platform;
+          return map;
+        }, {} as Record<string, string>);
+        
+        const messagesByDay = initializeMessagesByDay(daysBack);
+        
+        if (data && data.length > 0) {
+          data.forEach(message => {
+            const day = new Date(message.sent_at).toLocaleDateString();
+            if (messagesByDay[day]) {
+              messagesByDay[day].total += 1;
+              const convPlatform = platformMap[message.conversation_id];
+              if (convPlatform === 'facebook') {
+                messagesByDay[day].facebook += 1;
+              } else if (convPlatform === 'instagram') {
+                messagesByDay[day].instagram += 1;
+              }
+              if (message.sender_type === 'user') {
+                messagesByDay[day].user += 1;
+              } else if (message.sender_type === 'assistant') {
+                messagesByDay[day].assistant += 1;
+              }
+            }
+          });
+        }
+        
+        return formatMessageAnalytics(messagesByDay);
+        
+      } catch (error) {
+        console.error(`Attempt ${retryCount + 1}/${maxRetries}: Error in getMessageAnalytics:`, error);
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        if (isNetworkError(error)) {
+          retryCount++;
+          // Exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          // Not a network error, return empty data
+          return emptyAnalytics;
+        }
+      }
     }
-    return formatMessageAnalytics(messagesByDay);
+    
+    // If we exhausted all retries
+    console.error(`Failed to get message analytics after ${maxRetries} attempts:`, lastError);
+    return emptyAnalytics;
+    
   } catch (error) {
-    console.error('Error in getMessageAnalytics:', error);
+    console.error('Unhandled error in getMessageAnalytics:', error);
     return createEmptyAnalytics(daysBack);
   }
 }
@@ -698,58 +773,139 @@ export async function getDashboardStats(userId: string): Promise<DashboardStats>
       };
     }
     
-    const { data: conversations, error: conversationsError } = await supabase.from('conversations').select('id, platform').eq('user_id', userId);
-    if (conversationsError) {
-      console.error(`Error fetching conversations for dashboard stats for user ${userId}:`, conversationsError);
-      logSupabaseError(`getDashboardStats - conversations (${userId})`, conversationsError);
-      return { messageCount: 0, conversationCount: 0, responseTime: 0, successRate: 0, facebookPercentage: 0, instagramPercentage: 0 };
-    }
-    
-    if (!conversations || conversations.length === 0) {
-      return { messageCount: 0, conversationCount: 0, responseTime: 0, successRate: 0, facebookPercentage: 0, instagramPercentage: 0 };
-    }
-    
-    const conversationIds = conversations.map(c => c.id);
-    let messageCount = 0;
-    
-    try {
-      const { count, error: countError } = await supabase.from('messages').select('id', { count: 'exact', head: true }).in('conversation_id', conversationIds);
-      if (!countError) {
-        messageCount = count || 0;
-      }
-    } catch (countError) {
-      console.error(`Error counting messages for user ${userId}:`, countError);
-    }
-    
-    const conversationCount = conversations.length;
-    
-    let avgResponseTime = 0;
-    let successRate = 100;
-    
-    try {
-      const { data: allMessages, error: messagesError } = await supabase.from('messages').select('id, conversation_id, sender_type, sent_at').in('conversation_id', conversationIds).order('sent_at', { ascending: true });
-      if (!messagesError && allMessages) {
-        const responseMetrics = calculateResponseMetrics(allMessages, conversationIds);
-        avgResponseTime = responseMetrics.avgResponseTime;
-        successRate = responseMetrics.successRate;
-      }
-    } catch (metricsError) {
-      console.error(`Error calculating response metrics for user ${userId}:`, metricsError);
-    }
-    
-    const platformDistribution = calculatePlatformDistribution(conversations);
-    
-    return { 
-      messageCount, 
-      conversationCount, 
-      responseTime: avgResponseTime, 
-      successRate, 
-      facebookPercentage: platformDistribution.facebookPercentage, 
-      instagramPercentage: platformDistribution.instagramPercentage 
+    // Default empty stats as fallback
+    const emptyStats = {
+      messageCount: 0,
+      conversationCount: 0,
+      responseTime: 0,
+      successRate: 0,
+      facebookPercentage: 0,
+      instagramPercentage: 0
     };
+    
+    // Implement retry mechanism with backoff
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const { data: conversations, error: conversationsError } = await supabase.from('conversations').select('id, platform').eq('user_id', userId);
+        if (conversationsError) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching conversations for dashboard stats:`, conversationsError);
+          logSupabaseError(`getDashboardStats - conversations (${userId})`, conversationsError);
+          
+          if (isNetworkError(conversationsError)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error, return empty data
+            return emptyStats;
+          }
+        }
+        
+        if (!conversations || conversations.length === 0) {
+          return emptyStats;
+        }
+        
+        const conversationIds = conversations.map(c => c.id);
+        let messageCount = 0;
+        
+        try {
+          const { count, error: countError } = await supabase.from('messages').select('id', { count: 'exact', head: true }).in('conversation_id', conversationIds);
+          if (!countError) {
+            messageCount = count || 0;
+          } else if (isNetworkError(countError)) {
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        } catch (countError) {
+          console.error(`Error counting messages for user ${userId}:`, countError);
+          
+          if (isNetworkError(countError)) {
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        }
+        
+        const conversationCount = conversations.length;
+        
+        let avgResponseTime = 0;
+        let successRate = 100;
+        
+        try {
+          const { data: allMessages, error: messagesError } = await supabase
+            .from('messages')
+            .select('id, conversation_id, sender_type, sent_at')
+            .in('conversation_id', conversationIds)
+            .order('sent_at', { ascending: true });
+            
+          if (!messagesError && allMessages) {
+            const responseMetrics = calculateResponseMetrics(allMessages, conversationIds);
+            avgResponseTime = responseMetrics.avgResponseTime;
+            successRate = responseMetrics.successRate;
+          } else if (messagesError && isNetworkError(messagesError)) {
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        } catch (metricsError) {
+          console.error(`Error calculating response metrics for user ${userId}:`, metricsError);
+          
+          if (isNetworkError(metricsError)) {
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        }
+        
+        const platformDistribution = calculatePlatformDistribution(conversations);
+        
+        return { 
+          messageCount, 
+          conversationCount, 
+          responseTime: avgResponseTime, 
+          successRate, 
+          facebookPercentage: platformDistribution.facebookPercentage, 
+          instagramPercentage: platformDistribution.instagramPercentage 
+        };
+        
+      } catch (error) {
+        console.error(`Attempt ${retryCount + 1}/${maxRetries}: Error in getDashboardStats:`, error);
+        
+        if (isNetworkError(error)) {
+          retryCount++;
+          // Exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          // Not a network error, return empty data
+          return emptyStats;
+        }
+      }
+    }
+    
+    // If we exhausted all retries
+    console.error(`Failed to get dashboard stats after ${maxRetries} attempts`);
+    return emptyStats;
   } catch (error) {
-    console.error('Error getting dashboard stats:', error);
-    return { messageCount: 0, conversationCount: 0, responseTime: 0, successRate: 0, facebookPercentage: 0, instagramPercentage: 0 };
+    console.error('Unhandled error getting dashboard stats:', error);
+    return {
+      messageCount: 0,
+      conversationCount: 0,
+      responseTime: 0,
+      successRate: 0,
+      facebookPercentage: 0,
+      instagramPercentage: 0
+    };
   }
 }
 
@@ -853,27 +1009,66 @@ export async function getRecentConversations(userId: string, limit = 5) {
       console.warn('No user ID provided for recent conversations');
       return [];
     }
-    const { data, error } = await supabase.from('conversations').select(`
-      *,
-      messages:messages(
-        content,
-        sender_type,
-        sent_at
-      )
-    `).eq('user_id', userId).order('last_message_at', { ascending: false }).limit(limit).limit(1, { foreignTable: 'messages' });
-    if (error) {
-      console.error('Error getting recent conversations:', error);
-      logSupabaseError(`getRecentConversations (${userId})`, error);
-      return [];
+    
+    // Implement retry mechanism with backoff
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const { data, error } = await supabase.from('conversations').select(`
+          *,
+          messages:messages(
+            content,
+            sender_type,
+            sent_at
+          )
+        `).eq('user_id', userId).order('last_message_at', { ascending: false }).limit(limit).limit(1, { foreignTable: 'messages' });
+        
+        if (error) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching recent conversations:`, error);
+          logSupabaseError(`getRecentConversations (${userId})`, error);
+          
+          if (isNetworkError(error)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error
+            return [];
+          }
+        }
+        
+        if (!data || data.length === 0) return [];
+        
+        return data.map(conv => ({
+          ...conv,
+          latest_message: conv.messages && conv.messages.length > 0 ? conv.messages[0] : null,
+          messages: undefined
+        })) as Conversation[];
+        
+      } catch (error) {
+        console.error(`Attempt ${retryCount + 1}/${maxRetries}: Error in getRecentConversations:`, error);
+        
+        if (isNetworkError(error)) {
+          retryCount++;
+          // Exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          // Not a network error
+          return [];
+        }
+      }
     }
-    if (!data || data.length === 0) return [];
-    return data.map(conv => ({
-      ...conv,
-      latest_message: conv.messages && conv.messages.length > 0 ? conv.messages[0] : null,
-      messages: undefined
-    })) as Conversation[];
+    
+    // If we exhausted all retries
+    console.error(`Failed to get recent conversations after ${maxRetries} attempts`);
+    return [];
   } catch (error) {
-    console.error('Error getting recent conversations:', error);
+    console.error('Unhandled error getting recent conversations:', error);
     return [];
   }
 }
@@ -884,32 +1079,100 @@ export async function getMessageVolumeByHour(userId: string, daysBack = 7) {
       console.warn('No user ID provided for message volume by hour');
       return createEmptyHourlyData();
     }
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - daysBack);
-    const { data: conversations, error: conversationsError } = await supabase.from('conversations').select('id').eq('user_id', userId);
-    if (conversationsError) {
-      console.error(`Error fetching conversations for message volume by hour for user ${userId}:`, conversationsError);
-      logSupabaseError(`getMessageVolumeByHour - conversations (${userId})`, conversationsError);
-      return createEmptyHourlyData();
+    
+    // Implement retry mechanism with backoff
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - daysBack);
+        
+        const { data: conversations, error: conversationsError } = await supabase
+          .from('conversations')
+          .select('id')
+          .eq('user_id', userId);
+          
+        if (conversationsError) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching conversations for message volume:`, conversationsError);
+          logSupabaseError(`getMessageVolumeByHour - conversations (${userId})`, conversationsError);
+          
+          if (isNetworkError(conversationsError)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error
+            return createEmptyHourlyData();
+          }
+        }
+        
+        if (!conversations || conversations.length === 0) {
+          return createEmptyHourlyData();
+        }
+        
+        const conversationIds = conversations.map(c => c.id);
+        
+        const { data, error } = await supabase
+          .from('messages')
+          .select('sent_at')
+          .in('conversation_id', conversationIds)
+          .gte('sent_at', startDate.toISOString());
+          
+        if (error) {
+          console.warn(`Attempt ${retryCount + 1}/${maxRetries}: Error fetching messages for volume by hour:`, error);
+          logSupabaseError(`getMessageVolumeByHour - messages (${userId})`, error);
+          
+          if (isNetworkError(error)) {
+            retryCount++;
+            // Exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          } else {
+            // Not a network error
+            return createEmptyHourlyData();
+          }
+        }
+        
+        const hourCounts = Array(24).fill(0);
+        
+        if (data && data.length > 0) {
+          data.forEach(message => {
+            const hour = new Date(message.sent_at).getHours();
+            hourCounts[hour]++;
+          });
+        }
+        
+        return hourCounts.map((count, hour) => ({ 
+          hour, 
+          displayHour: `${hour}:00`, 
+          count 
+        }));
+        
+      } catch (error) {
+        console.error(`Attempt ${retryCount + 1}/${maxRetries}: Error in getMessageVolumeByHour:`, error);
+        
+        if (isNetworkError(error)) {
+          retryCount++;
+          // Exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          // Not a network error
+          return createEmptyHourlyData();
+        }
+      }
     }
-    if (!conversations || conversations.length === 0) return createEmptyHourlyData();
-    const conversationIds = conversations.map(c => c.id);
-    const { data, error } = await supabase.from('messages').select('sent_at').in('conversation_id', conversationIds).gte('sent_at', startDate.toISOString());
-    if (error) {
-      console.error(`Error fetching messages for volume by hour for user ${userId}:`, error);
-      logSupabaseError(`getMessageVolumeByHour - messages (${userId})`, error);
-      return createEmptyHourlyData();
-    }
-    const hourCounts = Array(24).fill(0);
-    if (data && data.length > 0) {
-      data.forEach(message => {
-        const hour = new Date(message.sent_at).getHours();
-        hourCounts[hour]++;
-      });
-    }
-    return hourCounts.map((count, hour) => ({ hour, displayHour: `${hour}:00`, count }));
+    
+    // If we exhausted all retries
+    console.error(`Failed to get message volume by hour after ${maxRetries} attempts`);
+    return createEmptyHourlyData();
   } catch (error) {
-    console.error('Error getting message volume by hour:', error);
+    console.error('Unhandled error getting message volume by hour:', error);
     return createEmptyHourlyData();
   }
 }
