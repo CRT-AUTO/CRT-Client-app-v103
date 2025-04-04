@@ -1,6 +1,6 @@
 // This module provides a message queue system to ensure reliable message processing
 
-const { createClient } = require('@supabase/supabase-js');
+const { createClient, increment } = require('@supabase/supabase-js');
 const { retryWithBackoff, isTransientError } = require('./error-recovery');
 
 // Initialize Supabase client with error handling
@@ -171,7 +171,7 @@ async function markMessageAsProcessing(messageId) {
       .update({ 
         status: 'processing',
         last_retry_at: new Date().toISOString(),
-        retry_count: supabase.raw('retry_count + 1')
+        retry_count: increment(1)  // Use atomic increment instead of supabase.raw
       })
       .eq('id', messageId)
       .select();
