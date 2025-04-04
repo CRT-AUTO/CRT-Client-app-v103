@@ -31,6 +31,7 @@ export function checkFacebookLoginStatus(): Promise<FacebookStatusResponse> {
 }
 
 // The callback function that will be called from checkLoginState
+// This aligns with the Facebook documentation pattern
 export function statusChangeCallback(response: FacebookStatusResponse): Promise<boolean> {
   return handleFacebookStatusChange(response);
 }
@@ -39,23 +40,37 @@ export function statusChangeCallback(response: FacebookStatusResponse): Promise<
 export function handleFacebookStatusChange(response: FacebookStatusResponse): Promise<boolean> {
   return new Promise(async (resolve) => {
     if (response.status === 'connected' && response.authResponse) {
+      // User is logged in to Facebook and has authorized the app
       console.log('Connected to Facebook, authorized app');
       
       try {
+        // If you want to use this token to authenticate with your backend
         const fbToken = response.authResponse.accessToken;
         const userId = response.authResponse.userID;
         
+        // Get additional user information from Facebook
         const userInfo = await getFacebookUserInfo(userId, fbToken);
+        
+        // You could use this to sign in to Supabase with a custom token
+        // or store Facebook credentials for later API calls
         console.log('Facebook user info:', userInfo);
         
+        // Sign in to Supabase with email from Facebook
         if (userInfo && userInfo.email) {
+          // In a real implementation, you would store this user in your database
+          // and link it with the Facebook account
           console.log('We have the user email from Facebook:', userInfo.email);
           
-          const redirectUri = 'https://crt-tech.org/oauth/facebook/callback';
+          // Instead of mock redirect, use actual redirect to callback with real code
+          // This will initiate the real OAuth flow
+          const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+          const redirectUri = `${appUrl}/oauth/facebook/callback`;
           const appId = import.meta.env.VITE_META_APP_ID;
           window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=public_profile,email,pages_show_list,pages_messaging`;
         } else {
-          window.location.href = 'https://crt-tech.org/oauth/facebook/callback?code=auth_code_${Date.now()}';
+          // Redirect to callback with auth code - using our fallback approach
+          const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+          window.location.href = `${appUrl}/oauth/facebook/callback?code=auth_code_${Date.now()}`;
         }
         
         resolve(true);
@@ -64,21 +79,25 @@ export function handleFacebookStatusChange(response: FacebookStatusResponse): Pr
         resolve(false);
       }
     } else if (response.status === 'not_authorized') {
+      // User is logged into Facebook but has not authorized the app
       console.log('Not authorized: User is logged into Facebook but has not authorized the app');
       
-      const redirectUri = 'https://crt-tech.org/oauth/facebook/callback';
+      // Redirect to Facebook OAuth dialog
+      const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+      const redirectUri = `${appUrl}/oauth/facebook/callback`;
       const appId = import.meta.env.VITE_META_APP_ID;
       window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=public_profile,email,pages_show_list,pages_messaging`;
       
       resolve(false);
     } else {
+      // User is not logged into Facebook
       console.log('User is not logged into Facebook');
       resolve(false);
     }
   });
 }
 
-// Function to check login state
+// Function to check login state - follows Facebook's documentation pattern
 export function checkLoginState() {
   FB.getLoginStatus(function(response: FacebookStatusResponse) {
     statusChangeCallback(response);
@@ -89,7 +108,9 @@ export function checkLoginState() {
 export function loginWithFacebook(): Promise<FacebookStatusResponse> {
   return new Promise((resolve, reject) => {
     if (typeof FB === 'undefined') {
-      const redirectUri = 'https://crt-tech.org/oauth/facebook/callback';
+      // If FB SDK is not loaded, redirect directly to the OAuth flow
+      const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+      const redirectUri = `${appUrl}/oauth/facebook/callback`;
       const appId = import.meta.env.VITE_META_APP_ID;
       window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=public_profile,email,pages_show_list,pages_messaging`;
       reject(new Error('Facebook SDK not loaded, redirecting to OAuth flow'));
@@ -99,9 +120,13 @@ export function loginWithFacebook(): Promise<FacebookStatusResponse> {
     FB.login((response) => {
       console.log("Facebook login response:", response);
       if (response.status === 'connected') {
-        window.location.href = 'https://crt-tech.org/oauth/facebook/callback?code=auth_code_${Date.now()}';
+        // Redirect to the callback URL with auth code if connected
+        const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+        window.location.href = `${appUrl}/oauth/facebook/callback?code=auth_code_${Date.now()}`;
       } else {
-        const redirectUri = 'https://crt-tech.org/oauth/facebook/callback';
+        // If not connected, proceed with the OAuth flow
+        const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+        const redirectUri = `${appUrl}/oauth/facebook/callback`;
         const appId = import.meta.env.VITE_META_APP_ID;
         window.location.href = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=public_profile,email,pages_show_list,pages_messaging`;
       }
