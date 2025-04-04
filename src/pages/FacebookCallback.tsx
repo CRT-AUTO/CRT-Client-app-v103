@@ -2,14 +2,19 @@ import React, { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { MessageSquare } from 'lucide-react';
-import axios from 'axios';
 
 export default function FacebookCallback() {
   const [error, setError] = useState<string | null>(null);
   const [processing, setProcessing] = useState(true);
   const [status, setStatus] = useState<'processing' | 'success' | 'error'>('processing');
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
   const location = useLocation();
   const navigate = useNavigate();
+
+  const addDebugInfo = (message: string) => {
+    console.log(message);
+    setDebugInfo(prev => [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`]);
+  };
 
   useEffect(() => {
     async function handleFacebookCallback() {
@@ -22,19 +27,28 @@ export default function FacebookCallback() {
           throw new Error('Authorization code not found');
         }
 
-        console.log('Processing Facebook callback with code:', code);
+        addDebugInfo(`Processing Facebook callback with code: ${code.substring(0, 10)}...`);
         setStatus('processing');
 
         // Get the current user
-        const { data: userData } = await supabase.auth.getUser();
+        const { data: userData, error: userError } = await supabase.auth.getUser();
+        if (userError) {
+          addDebugInfo(`Error getting user: ${userError.message}`);
+          throw userError;
+        }
+        
         if (!userData.user) {
+          addDebugInfo('User not authenticated');
           throw new Error('User not authenticated');
         }
+
+        addDebugInfo(`Authenticated as user ID: ${userData.user.id}`);
 
         // Use Facebook Graph API to get user pages
         // The APP_ID and redirect_uri must match what was used for the login
         const appId = import.meta.env.VITE_META_APP_ID;
-        const redirectUri = `${window.location.origin}/oauth/facebook/callback`;
+        const appUrl = import.meta.env.VITE_APP_URL || window.location.origin;
+        const redirectUri = `${appUrl}/oauth/facebook/callback`;
         
         // In a real implementation with proper security:
         // 1. The code would be sent to a server-side function
@@ -45,7 +59,7 @@ export default function FacebookCallback() {
         // For our demo application, we'll simulate the token exchange process
         
         try {
-          console.log('Simulating token exchange process with Facebook...');
+          addDebugInfo('Simulating token exchange process with Facebook...');
           
           // Generate a realistic Facebook page ID and token for demonstration
           const pageId = `fb_page_${Math.floor(Math.random() * 1000000000)}`;
@@ -54,6 +68,9 @@ export default function FacebookCallback() {
           // Calculate a date 60 days from now (typical token expiry)
           const expiryDate = new Date();
           expiryDate.setDate(expiryDate.getDate() + 60);
+          
+          addDebugInfo(`Generated page ID: ${pageId}`);
+          addDebugInfo(`Token expiry date: ${expiryDate.toISOString()}`);
           
           // Store the connection in the database
           const { error: dbError } = await supabase
@@ -65,8 +82,12 @@ export default function FacebookCallback() {
               token_expiry: expiryDate.toISOString()
             });
             
-          if (dbError) throw dbError;
+          if (dbError) {
+            addDebugInfo(`Database error: ${dbError.message}`);
+            throw dbError;
+          }
           
+          addDebugInfo('Facebook page connected successfully');
           setStatus('success');
           
           // Success! Wait a moment then redirect
@@ -75,10 +96,12 @@ export default function FacebookCallback() {
           }, 2000);
         } catch (apiError) {
           console.error('API Error:', apiError);
+          addDebugInfo(`API Error: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`);
           throw new Error('Failed to process Facebook authentication');
         }
       } catch (err) {
         console.error('Facebook OAuth Error:', err);
+        addDebugInfo(`Facebook OAuth Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
         setError('Failed to connect your Facebook account. Please try again.');
         setStatus('error');
         setProcessing(false);
@@ -130,6 +153,18 @@ export default function FacebookCallback() {
               </div>
               <p className="text-gray-700 mb-4">Redirecting you back to settings...</p>
             </>
+          )}
+          
+          {/* Debug info section - hidden by default */}
+          {false && debugInfo.length > 0 && (
+            <div className="mt-6 p-3 bg-gray-50 rounded-md text-left">
+              <p className="text-xs text-gray-500 font-semibold mb-1">Debug Information:</p>
+              <div className="text-xs text-gray-500 max-h-40 overflow-y-auto">
+                {debugInfo.map((info, idx) => (
+                  <div key={idx}>{info}</div>
+                ))}
+              </div>
+            </div>
           )}
         </div>
       </div>
