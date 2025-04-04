@@ -9,6 +9,8 @@ interface ConnectionStatusProps {
 const ConnectionStatus: React.FC<ConnectionStatusProps> = ({ onRetry }) => {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [supabaseStatus, setSupabaseStatus] = useState<'checking' | 'connected' | 'disconnected'>('checking');
+  const [lastChecked, setLastChecked] = useState<Date | null>(null);
+  const [checkCount, setCheckCount] = useState(0);
   
   // Check online status
   useEffect(() => {
@@ -26,41 +28,68 @@ const ConnectionStatus: React.FC<ConnectionStatusProps> = ({ onRetry }) => {
   
   // Check Supabase connection
   useEffect(() => {
+    let mounted = true;
+    
     const checkSupabaseConnection = async () => {
       if (!isOnline) {
         setSupabaseStatus('disconnected');
         return;
       }
       
+      // Don't check more than 10 times to avoid excessive API calls
+      if (checkCount > 10) {
+        return;
+      }
+      
       try {
         setSupabaseStatus('checking');
-        // Perform a simple ping to Supabase
-        const { data, error } = await supabase.rpc('ping', {}, {
-          count: 'exact',
-          head: true
-        });
         
-        if (error) {
-          console.error('Supabase connection check failed:', error);
-          setSupabaseStatus('disconnected');
-        } else {
-          setSupabaseStatus('connected');
+        // Simple anonymous check that doesn't require authentication
+        const { error } = await supabase.from('users').select('count').limit(1).single();
+        
+        // We don't care if there are no rows - only if there's a connection error
+        if (mounted) {
+          if (error && error.code !== 'PGRST116') { // PGRST116 is "No rows returned" which is OK
+            console.log('Supabase connection check failed:', error);
+            setSupabaseStatus('disconnected');
+          } else {
+            setSupabaseStatus('connected');
+          }
+          
+          setLastChecked(new Date());
+          setCheckCount(prev => prev + 1);
         }
       } catch (error) {
-        console.error('Error checking Supabase connection:', error);
-        setSupabaseStatus('disconnected');
+        if (mounted) {
+          console.error('Error checking Supabase connection:', error);
+          setSupabaseStatus('disconnected');
+          setLastChecked(new Date());
+          setCheckCount(prev => prev + 1);
+        }
       }
     };
     
+    // Initial check
     checkSupabaseConnection();
     
-    // Check connection periodically
-    const interval = setInterval(checkSupabaseConnection, 30000);
-    return () => clearInterval(interval);
-  }, [isOnline]);
+    // Check connection periodically - but less frequently over time
+    const interval = setInterval(checkSupabaseConnection, 
+      checkCount < 5 ? 10000 : 30000); // Check more frequently at first, then slow down
+    
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, [isOnline, checkCount]);
   
+  // Only show connection status warnings if actually having issues
   if (isOnline && supabaseStatus === 'connected') {
-    return null; // Don't show anything when everything is working
+    return null;
+  }
+  
+  // For disconnected state, only show after multiple checks to avoid false alarms
+  if (supabaseStatus === 'disconnected' && checkCount < 2) {
+    return null;
   }
   
   return (
@@ -89,6 +118,11 @@ const ConnectionStatus: React.FC<ConnectionStatusProps> = ({ onRetry }) => {
           <RefreshCw className="h-4 w-4 mr-1" />
           Retry
         </button>
+        {lastChecked && (
+          <span className="ml-2 text-xs opacity-75">
+            Last checked: {lastChecked.toLocaleTimeString()}
+          </span>
+        )}
       </div>
     </div>
   );
