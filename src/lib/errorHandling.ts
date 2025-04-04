@@ -94,6 +94,31 @@ export function getUserFriendlyErrorMessage(error: Error): string {
   return 'An unexpected error occurred. Please try again later.';
 }
 
+// Check if the error is a network error
+export function isNetworkError(error: any): boolean {
+  if (!error) return false;
+  
+  // Extract error message, handling different error object structures
+  const errorMessage = typeof error === 'string' 
+    ? error 
+    : error.message || error.error?.message || JSON.stringify(error);
+  
+  return (
+    errorMessage.includes('Failed to fetch') ||
+    errorMessage.includes('Network Error') ||
+    errorMessage.includes('network request failed') ||
+    errorMessage.includes('NetworkError') ||
+    errorMessage.includes('ECONNREFUSED') ||
+    errorMessage.includes('Network error') ||
+    errorMessage.includes('fetch failed') ||
+    (error.name === 'TypeError' && errorMessage.includes('fetch')) ||
+    (error.name === 'TypeError' && errorMessage.includes('network')) ||
+    (error.code === 'NETWORK_ERROR') ||
+    (error.status && error.status === 0) ||
+    (error.statusCode && error.statusCode === 0)
+  );
+}
+
 // Generic error handling for API calls
 export async function withErrorHandling<T>(
   apiCall: () => Promise<T>,
@@ -139,21 +164,6 @@ export function debounce<T extends (...args: any[]) => any>(
   };
 }
 
-// Check if the error is a network error
-export function isNetworkError(error: any): boolean {
-  if (!error) return false;
-  const errorMessage = error.message || String(error);
-  
-  return (
-    errorMessage.includes('Failed to fetch') ||
-    errorMessage.includes('Network Error') ||
-    errorMessage.includes('network request failed') ||
-    errorMessage.includes('NetworkError') ||
-    errorMessage.includes('ECONNREFUSED') ||
-    (error.name === 'TypeError' && errorMessage.includes('fetch'))
-  );
-}
-
 // Custom hook for handling loading states with timeout detection
 export function useLoadingWithTimeout(timeout = 10000) {
   const [loading, setLoading] = useState(false);
@@ -195,4 +205,51 @@ export function useNetworkStatus() {
   }, []);
   
   return isOnline;
+}
+
+// Function to retry a network request with exponential backoff
+export async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  options: {
+    maxRetries?: number;
+    initialDelay?: number;
+    backoffFactor?: number;
+    maxDelay?: number;
+    shouldRetry?: (error: any) => boolean;
+  } = {}
+): Promise<T> {
+  const {
+    maxRetries = 3,
+    initialDelay = 1000,
+    backoffFactor = 2,
+    maxDelay = 10000,
+    shouldRetry = isNetworkError
+  } = options;
+  
+  let lastError: any;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      
+      if (attempt === maxRetries || !shouldRetry(error)) {
+        throw error;
+      }
+      
+      // Calculate delay with jitter to prevent all clients retrying at once
+      const jitter = 0.2 * Math.random() - 0.1; // ±10% jitter
+      const calculatedDelay = Math.min(
+        maxDelay,
+        initialDelay * Math.pow(backoffFactor, attempt) * (1 + jitter)
+      );
+      
+      console.log(`Retrying after network error (attempt ${attempt + 1}/${maxRetries}), waiting ${calculatedDelay.toFixed(0)}ms`);
+      
+      await new Promise(resolve => setTimeout(resolve, calculatedDelay));
+    }
+  }
+  
+  throw lastError;
 }
