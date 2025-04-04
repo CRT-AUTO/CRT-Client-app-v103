@@ -1,8 +1,10 @@
 import { supabase } from './supabase';
-import { User } from '../types';
+import type { User } from '../types';
 
 export async function getCurrentUser(): Promise<User | null> {
   try {
+    console.log('Getting current user...');
+    
     // Get the current session first
     const { data: { session }, error: sessionError } = await supabase.auth.getSession();
     
@@ -12,17 +14,33 @@ export async function getCurrentUser(): Promise<User | null> {
     }
 
     if (!session?.user) {
+      console.log('No active session found');
       return null;
     }
 
-    // Get user metadata from session
-    const role = session.user.user_metadata?.role || 'customer';
-    
-    // Return user with role from metadata
+    // First try to get user data from the public users table
+    try {
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', session.user.id)
+        .single();
+
+      if (!userError && userData) {
+        return userData as User;
+      } else {
+        console.log('Could not find user in public.users table, checking auth.users or creating minimal user object');
+      }
+    } catch (e) {
+      console.error('Error querying public.users table:', e);
+    }
+
+    // If that fails, create a minimal user object from session data
+    console.log('Using session data to create minimal user object');
     return {
       id: session.user.id,
       email: session.user.email || '',
-      role: role,
+      role: session.user.user_metadata?.role || 'customer',
       created_at: session.user.created_at || new Date().toISOString()
     };
   } catch (error) {
@@ -44,6 +62,22 @@ export async function isAdmin(): Promise<boolean> {
       return false;
     }
 
+    // First try to get role from users table
+    try {
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select('role')
+        .eq('id', session.user.id)
+        .single();
+
+      if (!userError && userData) {
+        return userData.role === 'admin';
+      }
+    } catch (e) {
+      console.error('Error checking admin status in public.users table:', e);
+    }
+
+    // Fall back to user_metadata if table query fails
     return session.user.user_metadata?.role === 'admin';
   } catch (error) {
     console.error('Error checking admin status:', error);
