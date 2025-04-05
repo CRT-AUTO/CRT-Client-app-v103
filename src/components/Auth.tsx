@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { MessageSquare, Facebook } from 'lucide-react';
-import { supabase } from '../lib/supabase';
-import { checkFacebookLoginStatus, handleFacebookStatusChange, loginWithFacebook } from '../lib/facebookAuth';
+import { MessageSquare } from 'lucide-react';
+import { supabase, clearSupabaseAuth } from '../lib/supabase';
 
 interface AuthProps {
   initialError?: string | null;
@@ -9,113 +8,134 @@ interface AuthProps {
 
 export default function Auth({ initialError = null }: AuthProps) {
   const [loading, setLoading] = useState(false);
-  const [fbLoading, setFbLoading] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSignUp, setIsSignUp] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
-  const [fbButtonRendered, setFbButtonRendered] = useState(false);
-  const [useFallbackButton, setUseFallbackButton] = useState(true); // Always use fallback button
-  
-  // Check Facebook login status when component loads
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
+  const [authResult, setAuthResult] = useState<any>(null);
+  const [sessionCleared, setSessionCleared] = useState(false);
+
+  const addDebugInfo = (message: string) => {
+    console.log(message);
+    setDebugInfo(prev => {
+      // Limit to last 10 messages to prevent memory issues
+      const newMessages = [...prev, `${new Date().toISOString().slice(11, 19)}: ${message}`];
+      return newMessages.slice(-10);
+    });
+  };
+
+  // Force a cleanup of any existing session when this component mounts
   useEffect(() => {
-    const checkFbStatus = async () => {
+    const cleanupSession = async () => {
       try {
-        // Only proceed if FB SDK is loaded
-        if (typeof FB !== 'undefined') {
-          const response = await checkFacebookLoginStatus();
-          if (response.status === 'connected') {
-            // User is already logged in to Facebook and authorized the app
-            setFbLoading(true);
-            const success = await handleFacebookStatusChange(response);
-            if (success) {
-              // If FB login was successful, we could redirect or update UI
-              console.log('User already authenticated with Facebook');
+        // First try clearing with our helper function
+        await clearSupabaseAuth();
+        
+        // Extra step: manually clear all storage
+        try {
+          localStorage.clear();
+          sessionStorage.clear();
+          
+          // Also try to manually clear specific Supabase keys
+          const keyPrefixes = ['sb-', 'supabase', '@supabase', 'SUPABASE_AUTH'];
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && keyPrefixes.some(prefix => key.startsWith(prefix))) {
+              localStorage.removeItem(key);
             }
-            setFbLoading(false);
           }
+          
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const key = sessionStorage.key(i);
+            if (key && keyPrefixes.some(prefix => key.startsWith(prefix))) {
+              sessionStorage.removeItem(key);
+            }
+          }
+        } catch (storageError) {
+          addDebugInfo(`Error clearing storage: ${storageError instanceof Error ? storageError.message : 'Unknown'}`);
         }
+        
+        // Final step: perform an explicit signOut
+        await supabase.auth.signOut({ scope: 'global' });
+        
+        addDebugInfo("Successfully cleared all authentication data");
+        setSessionCleared(true);
       } catch (err) {
-        console.error('Error checking Facebook status:', err);
+        addDebugInfo(`Error clearing session: ${err instanceof Error ? err.message : 'Unknown'}`);
+        // Still mark as cleared to allow the user to continue
+        setSessionCleared(true);
       }
     };
-    
-    // Check for FB SDK
-    const checkFbSdk = () => {
-      if (typeof FB !== 'undefined') {
-        // Facebook SDK is loaded
-        checkFbStatus();
-        setFbButtonRendered(true);
-        return true;
-      }
-      return false;
-    };
-    
-    // Try immediately
-    if (!checkFbSdk()) {
-      // If not ready, set up a listener for when it initializes
-      const originalFbInit = window.fbAsyncInit;
-      window.fbAsyncInit = function() {
-        if (originalFbInit) originalFbInit();
-        
-        // Now that FB SDK is initialized, check status
-        FB.init({
-          appId: import.meta.env.VITE_META_APP_ID,
-          cookie: true,
-          xfbml: true,
-          version: 'v22.0'
-        });
-        
-        checkFbStatus();
-        setFbButtonRendered(true);
-      };
-    }
-  }, [fbButtonRendered]);
+
+    cleanupSession();
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    addDebugInfo(`Attempting ${isSignUp ? 'signup' : 'login'} with email: ${email}`);
 
     try {
+      // First clear any existing sessions again to be 100% sure
+      await clearSupabaseAuth();
+      
+      let result;
+      
       if (isSignUp) {
-        const { error } = await supabase.auth.signUp({
+        result = await supabase.auth.signUp({
           email,
           password,
+          options: {
+            data: {
+              role: 'customer' // Default role for new users
+            }
+          }
         });
-        if (error) throw error;
+        
+        if (result.error) throw result.error;
+        addDebugInfo("Signup successful");
+        
+        // Store result for debugging
+        setAuthResult(result);
+        
+        if (result.data.user && !result.data.session) {
+          // Email confirmation is required
+          setError('Please check your email to confirm your account before logging in.');
+        }
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
+        result = await supabase.auth.signInWithPassword({
           email,
           password,
         });
-        if (error) throw error;
+        
+        if (result.error) throw result.error;
+        addDebugInfo("Login successful");
+        
+        // Store result for debugging
+        setAuthResult(result);
       }
     } catch (error) {
+      addDebugInfo(`Auth error: ${error instanceof Error ? error.message : 'Unknown error'}`);
       setError(error instanceof Error ? error.message : 'An error occurred');
     } finally {
       setLoading(false);
     }
   };
-  
-  const handleFacebookLogin = async () => {
-    setFbLoading(true);
-    setError(null);
-    
-    try {
-      const response = await loginWithFacebook();
-      const success = await handleFacebookStatusChange(response);
-      
-      if (!success) {
-        setError('Facebook login was not successful');
-      }
-    } catch (err) {
-      console.error('Facebook login error:', err);
-      setError(err instanceof Error ? err.message : 'Facebook login failed');
-    } finally {
-      setFbLoading(false);
-    }
-  };
+
+  // If sessions haven't been cleared yet, show a loading indicator
+  if (!sessionCleared) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
+        <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
+          <h2 className="text-xl font-medium text-gray-900">Preparing Authentication</h2>
+          <p className="mt-2 text-sm text-gray-500">Clearing any existing sessions...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
@@ -190,24 +210,8 @@ export default function Auth({ initialError = null }: AuthProps) {
                 <div className="w-full border-t border-gray-300"></div>
               </div>
               <div className="relative flex justify-center text-sm">
-                <span className="px-2 bg-white text-gray-500">Or continue with</span>
+                <span className="px-2 bg-white text-gray-500">Or</span>
               </div>
-            </div>
-
-            <div className="mt-6">
-              {/* Single Facebook button implementation */}
-              <button
-                onClick={handleFacebookLogin}
-                disabled={fbLoading}
-                className="w-full flex justify-center items-center py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-white bg-[#1877F2] hover:bg-[#166FE5] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#1877F2] disabled:opacity-50"
-              >
-                {fbLoading ? (
-                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                ) : (
-                  <Facebook className="h-5 w-5 mr-2" />
-                )}
-                {fbLoading ? 'Processing...' : 'Continue with Facebook'}
-              </button>
             </div>
 
             <div className="mt-6">
@@ -219,6 +223,71 @@ export default function Auth({ initialError = null }: AuthProps) {
               </button>
             </div>
           </div>
+          
+          {/* Environment information for debugging */}
+          <div className="mt-6 p-3 bg-gray-50 rounded-md">
+            <div className="flex justify-between items-center">
+              <p className="text-xs text-gray-500 font-semibold">Environment:</p>
+              <button 
+                onClick={() => navigator.clipboard.writeText(JSON.stringify({
+                  url: import.meta.env.VITE_SUPABASE_URL ? 'Set' : 'Not set',
+                  key: import.meta.env.VITE_SUPABASE_ANON_KEY ? 'Set' : 'Not set',
+                  app: import.meta.env.VITE_APP_URL || 'Not set',
+                  mode: import.meta.env.MODE || 'unknown',
+                }, null, 2))}
+                className="text-xs text-indigo-600 hover:underline"
+              >
+                Copy Info
+              </button>
+            </div>
+            <div className="text-xs text-gray-500 mt-1">
+              <div className="flex justify-between">
+                <span>Supabase URL:</span>
+                <span>{import.meta.env.VITE_SUPABASE_URL ? '✅ Set' : '❌ Not set'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Supabase Key:</span>
+                <span>{import.meta.env.VITE_SUPABASE_ANON_KEY ? '✅ Set' : '❌ Not set'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Meta App ID:</span>
+                <span>{import.meta.env.VITE_META_APP_ID ? '✅ Set' : '❌ Not set'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span>Environment:</span>
+                <span>{import.meta.env.MODE || 'unknown'}</span>
+              </div>
+            </div>
+          </div>
+          
+          {debugInfo.length > 0 && (
+            <div className="mt-6 p-3 bg-gray-50 rounded-md">
+              <p className="text-xs text-gray-500 font-semibold mb-1">Debug Information:</p>
+              <div className="text-xs text-gray-500 max-h-40 overflow-y-auto">
+                {debugInfo.map((info, idx) => (
+                  <div key={idx}>{info}</div>
+                ))}
+              </div>
+            </div>
+          )}
+          
+          {authResult && (
+            <div className="mt-6 p-3 bg-gray-50 rounded-md">
+              <p className="text-xs text-gray-500 font-semibold mb-1">Auth Result:</p>
+              <div className="text-xs text-gray-500 max-h-40 overflow-y-auto">
+                <pre className="whitespace-pre-wrap">
+                  {JSON.stringify({
+                    user: authResult.data.user ? {
+                      id: authResult.data.user.id,
+                      email: authResult.data.user.email,
+                      created_at: authResult.data.user.created_at,
+                    } : null,
+                    session: authResult.data.session ? 'Present' : 'None'
+                  }, null, 2)}
+                </pre>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
